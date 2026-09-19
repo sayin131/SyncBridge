@@ -13,3 +13,7 @@ def ping():
 @app.post("/post")
 def echo(msg: Message):
 	return {"you_said": msg.text}
+
+@app.get("/mainfest")
+def manifest():
+	return scan("../test_sync")
