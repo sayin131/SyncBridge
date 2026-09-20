@@ -1,5 +1,5 @@
 fastapi
 pydantic
-jason
+json
 simplejson
 django
