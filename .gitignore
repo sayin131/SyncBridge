@@ -1,2 +1,4 @@
 laptop/venv/
-
+syncbridge.db
+syncbridge.db-shm
+syncbridge.db-wal
