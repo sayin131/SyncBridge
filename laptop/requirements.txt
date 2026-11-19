@@ -1,5 +1,8 @@
-fastapi
-pydantic
-json
-simplejson
-django
+fastapi>=0.110
+uvicorn[standard]>=0.29
+cryptography>=42.0
+qrcode[pil]>=7.4
+watchdog>=4.0
+pytest>=8.0
+httpx>=0.27
+websockets>=12.0
