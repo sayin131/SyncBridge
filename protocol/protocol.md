@@ -56,12 +56,28 @@ Phone                                   Laptop
   |                     POST /sync/upload-complete/{path} {sha256}
   |    DELETE_LAPTOP -> delete locally, POST /sync/ack {path, sha256: null}
   |    DELETE_PHONE  -> POST /sync/delete {path}
-  |    CONFLICT      -> download laptop's version under a "(laptop conflict TIMESTAMP)"
-  |                     name; leave base unset so it resurfaces until resolved
+  |    CONFLICT      -> converging "keep both" policy (see Conflict policy below)
 ```
 
 `base_hash` is stored **per (device_id, path)** on the laptop, so pairing a second phone
 never corrupts the first phone's sync state.
+
+## Conflict policy
+
+The laptop's version keeps the original filename; nothing is ever silently overwritten:
+
+| Situation | Result |
+|---|---|
+| Both sides edited (or both created different content) | Phone renames its file to `name (phone conflict TIMESTAMP).ext`, downloads the laptop's version under the original name. The renamed file is new, so it uploads on a second pass; both sides end with both versions. |
+| Laptop deleted, phone edited | Phone's edit wins and is re-uploaded. |
+| Phone deleted, laptop edited | Laptop's edited version is restored on the phone. |
+
+## Discovery
+
+The laptop advertises `_syncbridge._tcp` over mDNS (optional, `zeroconf`). If the stored IP stops
+answering, the phone looks for the service and then re-checks the pinned fingerprint, so a
+spoofed announcement cannot impersonate the laptop. Many campus networks block multicast; the
+fallback is scanning the QR code again.
 
 ## Endpoints
 
@@ -79,17 +95,22 @@ Rescans and returns the laptop's current file state:
 
 ### `POST /sync/plan`
 Request: `{"phone_manifest": {...}}` (same shape as `/manifest`)
-Response: `{"actions": [{"kind": "PUSH"|"PULL"|"DELETE_LAPTOP"|"DELETE_PHONE"|"CONFLICT", "path": str}, ...]}`
+Response: `{"actions": [{"kind": "PUSH"|"PULL"|"DELETE_LAPTOP"|"DELETE_PHONE"|"CONFLICT", "path": str, "sha256"?: str, "size"?: int}, ...]}`
+`sha256`/`size` describe the **laptop's current copy** and are present whenever the laptop has the
+file. The phone must verify any download against `sha256`; for a `CONFLICT` they are absent when
+the laptop deleted the file.
 
 ### `GET /sync/download/{path}`
 Supports `Range: bytes=START-` for resume. Returns raw file bytes, `206` on a range request.
 
-### `GET /sync/upload-status/{path}`
-`{"received_bytes": int}` — how much of an in-progress upload the server already has,
-so the client knows where to resume.
+### `GET /sync/upload-status/{path}?sha256=H`
+`{"received_bytes": int}` — how much of an in-progress upload of the version with hash `H`
+the server already has. Partial files are keyed by the final hash
+(`{path}.{H[:16]}.part`), so a resume can never mix bytes from two versions of a file.
 
-### `PUT /sync/upload/{path}?offset=N`
-Raw body = one chunk's bytes, written at `offset` into `{path}.part`.
+### `PUT /sync/upload/{path}?offset=N&sha256=H`
+Raw body = one chunk's bytes, written at `offset` into the partial file. `offset=0` truncates
+any stale partial. `409` if `offset` is beyond what the server has (re-query status).
 `{"received_bytes": int}`
 
 ### `POST /sync/upload-complete/{path}`
@@ -111,7 +132,8 @@ way, since the phone initiated that download itself.)
 Last 50 `sync_history` rows: `[{device_id, path, action, status, timestamp}, ...]`
 
 ### `WS /events`
-Server pushes `{"type": "file_changed", "path": str}` whenever the laptop's file watcher
+Requires the same `X-Device-Id` / `Authorization` headers on the handshake (closed with 4401
+otherwise). Server pushes `{"type": "file_changed", "path": str}` whenever the laptop's file watcher
 detects a settled (debounced) change. Clients should treat this as "run a sync cycle soon,"
 not as the change itself — always re-fetch via `/sync/plan`.
 

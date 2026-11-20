@@ -6,3 +6,5 @@ watchdog>=4.0
 pytest>=8.0
 httpx>=0.27
 websockets>=12.0
+zeroconf>=0.130
+pyinstaller>=6.0

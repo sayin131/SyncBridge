@@ -203,3 +203,18 @@ def recent_history(conn: sqlite3.Connection, limit=50):
     return conn.execute(
         "SELECT * FROM sync_history ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
+
+
+# ---------- device management (used by the desktop app) ----------
+
+def list_devices(conn: sqlite3.Connection):
+    return conn.execute(
+        "SELECT device_id, device_name, paired_at, last_seen FROM devices ORDER BY paired_at DESC"
+    ).fetchall()
+
+
+def delete_device(conn: sqlite3.Connection, device_id: str):
+    """Unpair: revoke the token and forget this device's sync state."""
+    with conn:
+        conn.execute("DELETE FROM devices WHERE device_id=?", (device_id,))
+        conn.execute("DELETE FROM device_base WHERE device_id=?", (device_id,))

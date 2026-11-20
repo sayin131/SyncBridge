@@ -98,19 +98,20 @@ def ensure_pinned(state: dict):
         sys.exit(1)
 
 
-def upload_file(state: dict, rel_path: str):
+def upload_file(state: dict, rel_path: str) -> str:
     full = safe_join(state["root"], rel_path)
     size = os.path.getsize(full)
+    digest = sha256_file(full)
     url = f"{base_url(state)}/sync/upload/{rel_path}"
+    h = auth_headers(state)
 
-    # resume support: ask server how much it already has
-    status = requests.get(
-        f"{base_url(state)}/sync/upload-status/{rel_path}", headers=auth_headers(state),
-        verify=False, timeout=10,
-    ).json()
-    offset = status.get("received_bytes", 0)
+    # resume: the server's partial file is keyed by this exact hash, so it is always
+    # a prefix of *this* version of the file
+    offset = requests.get(f"{base_url(state)}/sync/upload-status/{rel_path}",
+                          params={"sha256": digest}, headers=h, verify=False,
+                          timeout=10).json().get("received_bytes", 0)
     if offset > size:
-        offset = 0  # stale partial from a different version, start over
+        offset = 0
 
     with open(full, "rb") as f:
         f.seek(offset)
@@ -118,80 +119,123 @@ def upload_file(state: dict, rel_path: str):
             chunk = f.read(CHUNK_SIZE)
             if not chunk:
                 break
-            r = requests.put(
-                f"{url}?offset={offset}", data=chunk, headers=auth_headers(state),
-                verify=False, timeout=30,
-            )
+            r = requests.put(url, params={"offset": offset, "sha256": digest}, data=chunk,
+                             headers=h, verify=False, timeout=60)
             r.raise_for_status()
             offset += len(chunk)
-            pct = int(100 * offset / size) if size else 100
-            print(f"  uploading {rel_path}: {pct}%", end="\r")
+            print(f"  uploading {rel_path}: {int(100 * offset / size) if size else 100}%", end="\r")
     print()
 
-    digest = sha256_file(full)
-    r = requests.post(
-        f"{base_url(state)}/sync/upload-complete/{rel_path}",
-        json={"sha256": digest}, headers=auth_headers(state), verify=False, timeout=30,
-    )
+    r = requests.post(f"{base_url(state)}/sync/upload-complete/{rel_path}",
+                      json={"sha256": digest}, headers=h, verify=False, timeout=120)
     r.raise_for_status()
-    print(f"  PUSH complete: {rel_path} ({digest[:12]}...)")
+    print(f"  uploaded: {rel_path} ({digest[:12]}...)")
     return digest
 
 
-def download_file(state: dict, rel_path: str):
+def download_file(state: dict, rel_path: str, expected_sha: str | None) -> str:
     full = safe_join(state["root"], rel_path)
     os.makedirs(os.path.dirname(full), exist_ok=True)
-    part = full + ".part"
+    # partial is keyed by expected hash so a stale partial of an older version is never reused
+    tag = (expected_sha or "nohash")[:16]
+    part = f"{full}.{tag}.part"
 
     offset = os.path.getsize(part) if os.path.exists(part) else 0
     headers = {**auth_headers(state), "Range": f"bytes={offset}-"}
-    with requests.get(
-        f"{base_url(state)}/sync/download/{rel_path}", headers=headers,
-        verify=False, stream=True, timeout=30,
-    ) as r:
+    with requests.get(f"{base_url(state)}/sync/download/{rel_path}", headers=headers,
+                      verify=False, stream=True, timeout=60) as r:
         r.raise_for_status()
-        mode = "r+b" if offset else "wb"
-        with open(part, mode) as f:
-            f.seek(offset)
+        append = offset > 0 and r.status_code == 206
+        with open(part, "ab" if append else "wb") as f:
             for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                 f.write(chunk)
 
     digest = sha256_file(part)
+    if expected_sha and digest != expected_sha:
+        os.remove(part)
+        raise RuntimeError(f"hash mismatch for {rel_path}; discarded, will retry next sync")
     os.replace(part, full)
-    print(f"  PULL complete: {rel_path} ({digest[:12]}...)")
+    print(f"  downloaded: {rel_path} ({digest[:12]}...)")
     return digest
 
 
-def handle_conflict(state: dict, rel_path: str):
-    """Download the laptop's version alongside the phone's own, instead of overwriting."""
-    full = safe_join(state["root"], rel_path)
+def ack(state: dict, path: str, sha: str | None):
+    requests.post(f"{base_url(state)}/sync/ack", json={"path": path, "sha256": sha},
+                  headers=auth_headers(state), verify=False, timeout=10).raise_for_status()
+
+
+def handle_conflict(state: dict, action: dict) -> bool:
+    """
+    Converging conflict policy (laptop version keeps the original name):
+      laptop deleted, phone edited -> phone's edit wins: re-upload it (nothing lost)
+      phone deleted, laptop edited -> restore laptop's version here (nothing lost)
+      both changed                 -> rename phone's file to "name (phone conflict TS).ext",
+                                      download laptop's under the original name. The renamed
+                                      file is then a brand-new file and syncs to the laptop on
+                                      the next pass, so both sides end up with both versions.
+    Returns True if a follow-up sync pass is needed.
+    """
+    path, laptop_sha = action["path"], action.get("sha256")
+    full = safe_join(state["root"], path)
+    have_local = os.path.exists(full)
+
+    if laptop_sha is None and have_local:
+        upload_file(state, path)
+        print("  conflict resolved: laptop deleted it but you edited it, so your version was kept")
+        return False
+    if not have_local:
+        sha = download_file(state, path, laptop_sha)
+        ack(state, path, sha)
+        print("  conflict resolved: restored laptop's edited version")
+        return False
+
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
     base, ext = os.path.splitext(full)
-    conflict_name = f"{base} (laptop conflict {stamp}){ext}"
+    renamed = f"{base} (phone conflict {stamp}){ext}"
+    os.replace(full, renamed)
+    sha = download_file(state, path, laptop_sha)
+    ack(state, path, sha)
+    print(f"  CONFLICT: kept both. Laptop's is {path}; yours is {os.path.basename(renamed)}")
+    return True
 
-    if os.path.exists(full):
-        tmp_target = conflict_name
-    else:
-        tmp_target = full  # phone didn't have it at all; nothing to preserve
 
-    # download laptop's version into the conflict-named file
-    rel_conflict = os.path.relpath(tmp_target, state["root"]).replace(os.sep, "/")
-    headers = auth_headers(state)
-    with requests.get(
-        f"{base_url(state)}/sync/download/{rel_path}", headers=headers,
-        verify=False, stream=True, timeout=30,
-    ) as r:
-        r.raise_for_status()
-        os.makedirs(os.path.dirname(tmp_target), exist_ok=True)
-        with open(tmp_target, "wb") as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                f.write(chunk)
+def sync_pass(state: dict) -> tuple[int, bool]:
+    print(f"Scanning {state['root']} ...")
+    phone_manifest = scan(state["root"])
+    print(f"  {len(phone_manifest)} files locally")
+    resp = requests.post(f"{base_url(state)}/sync/plan", json={"phone_manifest": phone_manifest},
+                         headers=auth_headers(state), verify=False, timeout=60)
+    resp.raise_for_status()
+    actions = resp.json()["actions"]
+    print(f"Plan: {len(actions)} action(s)")
 
-    print(f"  CONFLICT on {rel_path}: kept both versions")
-    print(f"    phone version:  {rel_path}")
-    print(f"    laptop version: {rel_conflict}")
-    # Don't update base_hash — leave this path unresolved so it surfaces again
-    # on the next sync until the user manually reconciles it (deletes one copy).
+    again = False
+    for action in actions:
+        kind, path = action["kind"], action["path"]
+        print(f"- {kind}: {path}")
+        try:
+            if kind == "PUSH":            # laptop has newer/new -> phone downloads
+                sha = download_file(state, path, action.get("sha256"))
+                ack(state, path, sha)
+            elif kind == "PULL":          # phone has newer/new -> phone uploads
+                upload_file(state, path)
+            elif kind == "DELETE_LAPTOP":  # laptop deleted it -> delete here
+                full = safe_join(state["root"], path)
+                if os.path.exists(full):
+                    os.remove(full)
+                ack(state, path, None)
+                print(f"  deleted locally: {path}")
+            elif kind == "DELETE_PHONE":   # phone deleted it -> tell laptop
+                requests.post(f"{base_url(state)}/sync/delete", json={"path": path},
+                              headers=auth_headers(state), verify=False, timeout=10).raise_for_status()
+                print(f"  told laptop to delete: {path}")
+            elif kind == "CONFLICT":
+                again = handle_conflict(state, action) or again
+            else:
+                print(f"  (unknown action {kind}, skipped)")
+        except Exception as e:  # one bad file must not abort the whole sync
+            print(f"  FAILED: {e}")
+    return len(actions), again
 
 
 def cmd_sync(args):
@@ -199,63 +243,16 @@ def cmd_sync(args):
     if not state:
         print("Not paired yet. Run `python client.py pair ...` first.")
         sys.exit(1)
-
     ensure_pinned(state)
-    print(f"Scanning {state['root']} ...")
-    phone_manifest = scan(state["root"])
-    print(f"  {len(phone_manifest)} files locally")
 
-    print("Requesting sync plan from laptop...")
-    resp = requests.post(
-        f"{base_url(state)}/sync/plan",
-        json={"phone_manifest": phone_manifest},
-        headers=auth_headers(state), verify=False, timeout=30,
-    )
-    resp.raise_for_status()
-    actions = resp.json()["actions"]
-    print(f"Plan: {len(actions)} action(s)")
-
-    if not actions:
+    n, again = sync_pass(state)
+    if again:  # conflict copies created; push them to the laptop
+        print("\nSecond pass to propagate conflict copies...")
+        sync_pass(state)
+    if n == 0:
         print("Already in sync.")
-        return
-
-    for action in actions:
-        kind, path = action["kind"], action["path"]
-        print(f"- {kind}: {path}")
-
-        if kind == "PUSH":
-            # laptop has a new/changed file the phone doesn't -> phone PULLs it
-            digest = download_file(state, path)
-            requests.post(f"{base_url(state)}/sync/ack", json={"path": path, "sha256": digest},
-                           headers=auth_headers(state), verify=False, timeout=10)
-
-        elif kind == "PULL":
-            # phone has a new/changed file the laptop doesn't -> phone PUSHes it
-            digest = upload_file(state, path)
-            # server already set its own base on upload-complete; nothing more to do
-
-        elif kind == "DELETE_LAPTOP":
-            # laptop deleted it -> phone should delete its local copy too
-            full = safe_join(state["root"], path)
-            if os.path.exists(full):
-                os.remove(full)
-            requests.post(f"{base_url(state)}/sync/ack", json={"path": path, "sha256": None},
-                           headers=auth_headers(state), verify=False, timeout=10)
-            print(f"  deleted locally: {path}")
-
-        elif kind == "DELETE_PHONE":
-            # phone deleted it -> tell laptop to delete its copy too
-            requests.post(f"{base_url(state)}/sync/delete", json={"path": path},
-                           headers=auth_headers(state), verify=False, timeout=10)
-            print(f"  told laptop to delete: {path}")
-
-        elif kind == "CONFLICT":
-            handle_conflict(state, path)
-
-        else:
-            print(f"  (unknown action kind: {kind}, skipping)")
-
-    print("Sync cycle complete.")
+    else:
+        print("Sync cycle complete.")
 
 
 # ---------- status ----------
